@@ -1,8 +1,8 @@
 #![allow(non_upper_case_globals)]
 use soroban_sdk::storage::{Instance, Temporary};
-use soroban_sdk::{panic_with_error, Address, Env, Vec};
+use soroban_sdk::{Address, Env, Symbol, Vec, panic_with_error};
 
-use crate::extensions;
+use crate::{PriceOracleContractClient, extensions};
 use crate::types;
 
 use extensions::u128_helper::U128Helper;
@@ -14,6 +14,9 @@ const ASSETS: &str = "assets";
 const BASE_ASSET: &str = "base_asset";
 const DECIMALS: &str = "decimals";
 const RESOLUTION: &str = "resolution";
+const FXS: &str = "fxs";
+const FX_ORACLE_ADDRESS: &str = "fx_oracle_address";
+const MAX_YIELD_DEVIATION: &str = "max_yield_deviation";
 
 pub trait EnvExtensions {
     fn get_admin(&self) -> Option<Address>;
@@ -38,9 +41,11 @@ pub trait EnvExtensions {
 
     fn get_price(&self, asset: u8, timestamp: u64) -> Option<i128>;
 
-    fn set_price(&self, asset: u8, price: i128, timestamp: u64, ledgers: u32);
+    fn set_price(&self, asset: u8, fx: Symbol, price: i128, timestamp: u64, ledgers: u32);
 
     fn get_last_timestamp(&self) -> u64;
+
+    fn obtain_record_timestamp(&self) -> u64;
 
     fn set_last_timestamp(&self, timestamp: u64);
 
@@ -48,13 +53,33 @@ pub trait EnvExtensions {
 
     fn set_assets(&self, assets: Vec<Asset>);
 
+    fn get_fxs(&self) -> Vec<Symbol>;
+
+    fn set_fxs(&self, fxs: Vec<Symbol>);
+
     fn set_asset_index(&self, asset: &Asset, index: u32);
 
     fn get_asset_index(&self, asset: &Asset) -> Option<u8>;
 
+    fn get_fx_index(&self, fx: &Symbol) -> Option<u8>;
+
+    fn set_fx_index(&self, fx: &Symbol, index: u32);
+
     fn panic_if_not_admin(&self);
 
     fn is_initialized(&self) -> bool;
+
+    fn get_fx_oracle_address(&self) -> Option<Address>;
+
+    fn set_fx_oracle_address(&self, address: &Address);
+
+    fn get_max_yield_deviation(&self) -> u32;
+
+    fn set_max_yield_deviation(&self, percent: u32);
+
+    fn get_last_yield_rate(&self, asset: u8, timestamp: u64) -> Option<i128>;
+
+    fn set_last_yield_rate(&self, asset: u8, timestamp: u64, yield_rate: i128, ledgers: u32);
 }
 
 impl EnvExtensions for Env {
@@ -106,14 +131,86 @@ impl EnvExtensions for Env {
 
     fn get_price(&self, asset: u8, timestamp: u64) -> Option<i128> {
         //build the key for the price
-        let data_key = U128Helper::encode_price_record_key(timestamp, asset);
+        let data_key = U128Helper::encode_record_key(timestamp, asset);
         //get the price
         get_temporary_storage(self).get(&data_key)
     }
 
-    fn set_price(&self, asset: u8, price: i128, timestamp: u64, ledgers_to_live: u32) {
+    fn set_price(&self, asset: u8, fx: Symbol, yield_rate: i128, timestamp: u64, ledgers_to_live: u32) {
+        //validate yield_rate >= 1.0 (with matching decimals)
+        let decimals = self.get_decimals();
+        let min_yield_rate =  match 10i128.checked_pow(decimals) {  
+            Some(val) => val,
+            None => panic_with_error!(self, Error::IntegerOverflow),
+        };
+        if yield_rate < min_yield_rate {
+            panic_with_error!(self, Error::InvalidYieldRate);
+        }
+
+        // Retrieve the last yield rate for this asset from the previous timestamp (if it exists)
+        // But only up to the last two resolution cycles
+        let last_timestamp = self.obtain_record_timestamp();
+        let previous_yield_rate = if last_timestamp > 0 {
+            self.get_last_yield_rate(asset, last_timestamp)
+        } else {
+            None
+        };
+        
+        if let Some(prev_rate) = previous_yield_rate {
+            // Monotonic check: allow yield rate to decrease by up to 1%
+            // This is needed because the underlying interest-bearing algorithm can cause slight drops
+            if yield_rate < prev_rate {
+                // Calculate the percentage drop: ((prev_rate - yield_rate) / prev_rate) * 100
+                let drop = match prev_rate.checked_sub(yield_rate) {
+                    Some(val) => val,
+                    None => panic_with_error!(self, Error::IntegerOverflow),
+                };
+                let drop_times_100 = match drop.checked_mul(100) {
+                    Some(val) => val,
+                    None => panic_with_error!(self, Error::IntegerOverflow),
+                };
+                let percentage_drop = match drop_times_100.checked_div(prev_rate) {
+                    Some(val) => val,
+                    None => panic_with_error!(self, Error::IntegerOverflow),
+                };
+                
+                // If drop is more than 1%, reject it
+                if percentage_drop > 1 {
+                    panic_with_error!(self, Error::YieldRateDecreased);
+                }
+            }
+            
+            // Deviation check: calculate absolute percentage change
+            // Formula: (new - old) / old * 100
+            let change = match yield_rate.checked_sub(prev_rate) {
+                Some(val) => val,
+                None => panic_with_error!(self, Error::IntegerOverflow),
+            };
+            
+            // Use checked operations to prevent overflow
+            let change_times_100 = match change.checked_mul(100) {
+                Some(val) => val,
+                None => panic_with_error!(self, Error::IntegerOverflow),
+            };
+            
+            let percentage_change = match change_times_100.checked_div(prev_rate) {
+                Some(val) => val,
+                None => panic_with_error!(self, Error::IntegerOverflow),
+            };
+            
+            let max_deviation = self.get_max_yield_deviation() as i128;
+            if percentage_change > max_deviation {
+                panic_with_error!(self, Error::YieldRateDeviationExceeded);
+            }
+        }
+        
+        // Store the new yield rate for future comparisons
+        self.set_last_yield_rate(asset, timestamp, yield_rate, ledgers_to_live);
+
         //build the key for the price
-        let data_key = U128Helper::encode_price_record_key(timestamp, asset);
+        let data_key = U128Helper::encode_record_key(timestamp, asset);
+        let fx_price = get_reflector_fx_price(self, fx, timestamp);
+        let price = get_price_with_yield(self, yield_rate, fx_price, decimals);
 
         //set the price
         let temps_storage = get_temporary_storage(&self);
@@ -131,6 +228,20 @@ impl EnvExtensions for Env {
             .unwrap_or_default()
     }
 
+    fn obtain_record_timestamp(&self) -> u64 {
+        let last_timestamp = self.get_last_timestamp();
+        let ledger_timestamp = self.ledger().timestamp() * 1000; //convert to milliseconds
+        let resolution = self.get_resolution() as u64;
+        if last_timestamp == 0 //no prices yet
+            || last_timestamp > ledger_timestamp //last timestamp is in the future
+            || ledger_timestamp - last_timestamp >= resolution * 2
+        //last timestamp is too far in the past, so we cannot return the last price
+        {
+            return 0;
+        }
+        last_timestamp
+    }
+
     fn set_last_timestamp(&self, timestamp: u64) {
         get_instance_storage(&self).set(&LAST_TIMESTAMP, &timestamp);
     }
@@ -140,9 +251,19 @@ impl EnvExtensions for Env {
             .get(&ASSETS)
             .unwrap_or_else(|| Vec::new(&self))
     }
-
+    
     fn set_assets(&self, assets: Vec<Asset>) {
         get_instance_storage(&self).set(&ASSETS, &assets);
+    }
+
+    fn get_fxs(&self) -> Vec<Symbol> {
+        get_instance_storage(&self)
+            .get(&FXS)
+            .unwrap_or_else(|| Vec::new(&self))
+    }
+
+    fn set_fxs(&self, fxs: Vec<Symbol>) {
+        get_instance_storage(&self).set(&FXS, &fxs);
     }
 
     fn set_asset_index(&self, asset: &Asset, index: u32) {
@@ -172,12 +293,60 @@ impl EnvExtensions for Env {
         return Some(index.unwrap() as u8);
     }
 
+    fn get_fx_index(&self, fx: &Symbol) -> Option<u8> {
+        let index: Option<u32> = get_instance_storage(self).get(&fx);
+        if index.is_none() {
+            return None;
+        }
+        return Some(index.unwrap() as u8);
+    }
+
+    fn set_fx_index(&self, fx: &Symbol, index: u32) {
+        get_instance_storage(self).set(&fx, &index);
+    }
+
     fn panic_if_not_admin(&self) {
         let admin = self.get_admin();
         if admin.is_none() {
             panic_with_error!(self, Error::Unauthorized);
         }
         admin.unwrap().require_auth()
+    }
+
+    fn get_fx_oracle_address(&self) -> Option<Address> {
+        get_instance_storage(self).get(&FX_ORACLE_ADDRESS)
+    }
+
+    fn set_fx_oracle_address(&self, address: &Address) {
+        get_instance_storage(self).set(&FX_ORACLE_ADDRESS, address);
+    }
+
+    fn get_max_yield_deviation(&self) -> u32 {
+        get_instance_storage(self).get(&MAX_YIELD_DEVIATION).unwrap_or(0)
+    }
+
+    fn set_max_yield_deviation(&self, percent: u32) {
+        get_instance_storage(self).set(&MAX_YIELD_DEVIATION, &percent);
+    }
+
+    fn get_last_yield_rate(&self, asset: u8, timestamp: u64) -> Option<i128> {
+        // Store yield rate per asset and timestamp, similar to price data
+        // Use the same key encoding as price records but with bit 8 set to distinguish
+        // Bit 8 is in the unused range (bits 8-63) and will never conflict with timestamp (bits 64-127) or asset (bits 0-7)
+        let data_key = U128Helper::encode_record_key(timestamp, asset) | (1u128 << 8);
+        get_temporary_storage(self).get(&data_key)
+    }
+
+    fn set_last_yield_rate(&self, asset: u8, timestamp: u64, yield_rate: i128, ledgers: u32) {
+        // Store yield rate per asset and timestamp, similar to price data
+        // Use the same key encoding as price records but with bit 8 set to distinguish
+        // Bit 8 is in the unused range (bits 8-63) and will never conflict with timestamp (bits 64-127) or asset (bits 0-7)
+        let data_key = U128Helper::encode_record_key(timestamp, asset) | (1u128 << 8);
+        let temps_storage = get_temporary_storage(self);
+        temps_storage.set(&data_key, &yield_rate);
+        if ledgers > 16 {
+            temps_storage.extend_ttl(&data_key, ledgers, ledgers);
+        }
     }
 }
 
@@ -187,4 +356,76 @@ fn get_instance_storage(e: &Env) -> Instance {
 
 fn get_temporary_storage(e: &Env) -> Temporary {
     e.storage().temporary()
+}
+
+// The yield rate is sent as a 14 decimal place number, such as 110987898736637 (for 1.10987898736637%)
+// To get the price with yield, we need to multiply the fx rate of the fiat by this yield percent,
+// and then divide by 10^14 to get the price with yield.
+fn get_price_with_yield(e: &Env, yield_rate: i128, fx_price: i128, decimals: u32) -> i128 {
+    // Use checked multiplication to prevent overflow
+    let intermediate = match fx_price.checked_mul(yield_rate) {
+        Some(val) => val,
+        None => panic_with_error!(e, Error::IntegerOverflow),
+    };
+    
+    // Use checked division to handle edge cases
+    let divisor = match 10i128.checked_pow(decimals) {
+        Some(val) => val,
+        None => panic_with_error!(e, Error::IntegerOverflow),
+    };
+    match intermediate.checked_div(divisor) {
+        Some(val) => val,
+        None => panic_with_error!(e, Error::IntegerOverflow),
+    }
+}
+
+fn get_reflector_fx_price(e: &Env, fx: Symbol, contract_next_timestamp: u64) -> i128 {
+    if fx == Symbol::new(e, "USD") {
+        return match 10i128.checked_pow(e.get_decimals()) {
+            Some(val) => val,
+            None => panic_with_error!(e, Error::IntegerOverflow),
+        };
+    }
+    let reflector_client = get_reflector_oracle(e);
+    let ticker = Asset::Other(fx);
+    
+    // Get the last price from the oracle (single call instead of last_timestamp + price)
+    let price_data = reflector_client.lastprice(&ticker);
+    if price_data.is_none() {
+        panic_with_error!(&e, Error::StaleFxPrice);
+    }
+    
+    let price_data = price_data.unwrap();
+    
+    // Check timestamp drift: oracle timestamp should be within 2 resolutions of contract's next timestamp
+    if contract_next_timestamp > 0 {
+        // Convert oracle timestamp from seconds to milliseconds
+        let oracle_timestamp_ms = match price_data.timestamp.checked_mul(1000) {
+            Some(val) => val,
+            None => panic_with_error!(e, Error::IntegerOverflow),
+        };
+        let resolution_ms = e.get_resolution() as u64; // resolution is in milliseconds
+        let max_drift = 2 * resolution_ms;
+        
+        // Calculate absolute difference
+        let drift = oracle_timestamp_ms.abs_diff(contract_next_timestamp);
+        
+        if drift > max_drift {
+            panic_with_error!(&e, Error::FxOracleTimestampDrift);
+        }
+    }
+    
+    // Validate the price
+    let fx_price = price_data.price;
+    if fx_price <= 0 {
+        panic_with_error!(&e, Error::InvalidFxPrice);
+    }
+    fx_price
+}
+
+fn get_reflector_oracle(e: &Env) -> PriceOracleContractClient {
+    // Get the FX oracle address from storage (set during config)
+    let oracle_address = e.get_fx_oracle_address()
+        .unwrap_or_else(|| panic_with_error!(e, Error::FxOracleUnavailable));
+    PriceOracleContractClient::new(&e, &oracle_address)
 }
