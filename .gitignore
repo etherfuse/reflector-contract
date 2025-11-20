@@ -2,3 +2,4 @@
 /target
 /price-oracle/test_snapshots
 /test_snapshots
+coverage.json

@@ -1,0 +1,77 @@
+[tools]
+"cargo:cargo-llvm-cov" = "0.6.13"
+
+[env]
+TESTNET_CONTRACT_ID = "CD73V4BQO6HHZU5KKJ4D22JO6MHZP3CQXDTIBD4S3PVCDXDY45RCAO4U"
+MIN_COVERAGE = "90"
+
+# Build tasks
+[tasks.build-testnet]
+description = "Build contract for testnet with logs"
+run = """
+cargo build --target wasm32-unknown-unknown --profile release-with-logs
+stellar contract optimize --wasm target/wasm32-unknown-unknown/release-with-logs/etherfuse_yield_oracle.wasm
+"""
+
+# Deploy tasks
+[tasks.deploy-testnet]
+description = "Deploy contract to testnet"
+depends = ["build-testnet"]
+run = "stellar contract deploy --network testnet --source blend-test-net --wasm target/wasm32-unknown-unknown/release-with-logs/etherfuse_yield_oracle.optimized.wasm"
+
+# Update tasks
+[tasks.update-testnet]
+description = "Update existing testnet contract"
+depends = ["build-testnet"]
+run = """
+HASH=$(stellar contract upload --source blend-test-net --wasm target/wasm32-unknown-unknown/release-with-logs/etherfuse_yield_oracle.optimized.wasm | tail -n 1)
+stellar contract invoke --id $TESTNET_CONTRACT_ID --source blend-test-net --send=yes -- update_contract --wasm_hash $HASH
+"""
+
+# Test tasks
+[tasks.test]
+alias = "t"
+description = "Run all tests"
+run = "cargo test"
+
+# Coverage tasks
+[tasks.coverage]
+alias = "cov"
+description = "Run tests with coverage summary"
+run = "cargo llvm-cov --all-features --workspace"
+
+[tasks.coverage-html]
+alias = "cov-html"
+description = "Run tests with coverage and generate HTML report"
+run = """
+cargo llvm-cov --all-features --workspace --html
+echo "Coverage report generated at: target/llvm-cov/html/index.html"
+"""
+
+[tasks.coverage-open]
+alias = "cov-open"
+description = "Run tests with coverage and open HTML report"
+run = "cargo llvm-cov --all-features --workspace --open"
+
+[tasks.coverage-check]
+alias = "cov-check"
+description = "Check if coverage meets minimum threshold"
+run = """
+COVERAGE=$(cargo llvm-cov --all-features --workspace --summary-only | grep -oE '[0-9]+\\.[0-9]+%' | head -1 | sed 's/%//')
+echo "Coverage: ${COVERAGE}%"
+echo "Minimum required: ${MIN_COVERAGE}%"
+if [ $(echo "$COVERAGE < $MIN_COVERAGE" | bc -l) -eq 1 ]; then
+  echo "❌ Coverage ${COVERAGE}% is below minimum threshold of ${MIN_COVERAGE}%"
+  exit 1
+else
+  echo "✅ Coverage ${COVERAGE}% meets minimum threshold of ${MIN_COVERAGE}%"
+fi
+"""
+
+[tasks.coverage-lcov]
+alias = "cov-lcov"
+description = "Generate LCOV report for CI/CD"
+run = """
+cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+echo "LCOV report generated at: lcov.info"
+"""
