@@ -2,6 +2,7 @@
 "cargo:cargo-llvm-cov" = "0.6.13"
 
 [env]
+MAINNET_CONTRACT_ID = "CCXUCI36ZMUPHAQENQURA4R6QMXA7F4KYWUGNFLQ7ADJ5YEMPJV7PNPL"
 TESTNET_CONTRACT_ID = "CD73V4BQO6HHZU5KKJ4D22JO6MHZP3CQXDTIBD4S3PVCDXDY45RCAO4U"
 MIN_COVERAGE = "90"
 
@@ -13,11 +14,23 @@ cargo build --target wasm32-unknown-unknown --profile release-with-logs
 stellar contract optimize --wasm target/wasm32-unknown-unknown/release-with-logs/etherfuse_yield_oracle.wasm
 """
 
+[tasks.build-mainnet]
+description = "Build contract for mainnet with logs"
+run = """
+cargo build --target wasm32-unknown-unknown --profile release
+stellar contract optimize --wasm target/wasm32-unknown-unknown/release/etherfuse_yield_oracle.wasm
+"""
+
 # Deploy tasks
 [tasks.deploy-testnet]
 description = "Deploy contract to testnet"
 depends = ["build-testnet"]
 run = "stellar contract deploy --network testnet --source blend-test-net --wasm target/wasm32-unknown-unknown/release-with-logs/etherfuse_yield_oracle.optimized.wasm"
+
+[tasks.deploy-mainnet]
+description = "Deploy contract to mainnet"
+depends = ["build-mainnet"]
+run = "stellar contract deploy --network mainnet --source blend-mainnet --wasm target/wasm32-unknown-unknown/release/etherfuse_yield_oracle.optimized.wasm --fee 500"
 
 # Update tasks
 [tasks.update-testnet]
